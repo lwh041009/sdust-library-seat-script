@@ -20,9 +20,8 @@
 main.py              主程序，负责读取配置、获取 Token、定时抢座
 token_refresher.py   单独刷新 Token 的工具
 crypto_core.py       加密相关逻辑
-login.py             登录接口尝试工具，当前主要使用 Reqable 抓包 Token
 user_data.json       个人配置文件，不要上传真实内容
-启动.bat             Windows 一键启动脚本
+启动.bat             Windows 一键启动脚本（可自行设置）
 ```
 
 ## 环境要求
@@ -180,14 +179,4 @@ python token_refresher.py
 检查 `target_date` 和 `snipe_time`。脚本的实际开抢时间是 `target_date` 前一天的 `snipe_time`。
 
 例如预约 `2026-05-24`，开抢时间就是 `2026-05-23 22:30:00`。
-
-## 上传 GitHub 前注意
-
-不要上传包含真实账号信息的 `user_data.json`。其中可能包含：
-
-- 学号
-- 密码
-- Token
-
-建议上传一个脱敏示例文件，例如 `user_data.example.json`，真实的 `user_data.json` 放入 `.gitignore`。
 
