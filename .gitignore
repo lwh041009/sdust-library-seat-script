@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+
+# 本地真实配置，包含学号、密码和 Token
+user_data.json

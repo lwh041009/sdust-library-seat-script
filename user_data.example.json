@@ -1,0 +1,17 @@
+{
+    "token": "",
+    "student_id": "你的学号",
+    "password": "你的密码",
+    "target_date": "2026-05-23",
+    "auto_update_target_date": true,
+    "seat_code": "301010A",
+    "snipe_time": "22:30:00",
+    "start_hour": "09:00:00",
+    "end_hour": "22:00:00",
+    "first_bullet_advance_ms": 800,
+    "bullet_gap_ms": 150,
+    "snipe_cooldown": 3,
+    "snipe_interval": 0.8,
+    "snipe_max": 99999,
+    "request_timeout": 2
+}
