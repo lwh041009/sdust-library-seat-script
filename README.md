@@ -218,3 +218,5 @@ python token_refresher.py
 ```
 
 括号里的值越接近 `+0.000s`，说明越贴近准点。正数代表晚于开抢时间，负数代表提前发送；如果配置了 `fire_advance_ms`，出现对应的负数是正常的。
+### 问题反馈
+邮箱：lwh041009@gmail.com
