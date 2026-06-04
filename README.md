@@ -100,7 +100,7 @@ pip install requests urllib3 pycryptodome
 | `time_sync_timeout` | 单次校时超时时间，单位秒 |
 | `time_sync_samples` | 每个 NTP 服务器采样次数，脚本会优先采用网络延迟最低的一次 |
 | `snipe_cooldown` | 首发失败后，等待几秒进入捡漏 |
-| `snipe_interval` | 捡漏请求间隔，脚本会自动限制为至少 `5.2` 秒 |
+| `snipe_interval` | 捡漏请求间隔，脚本会自动限制为至少 5.2 秒 |
 | `snipe_max` | 最大捡漏次数 |
 | `request_timeout` | 单次预约请求超时时间，单位秒 |
 
