@@ -1,5 +1,5 @@
 """
-main.py - 图书馆抢座（两发策略 + 精确计时）
+main.py - 图书馆抢座（准点单发 + 捡漏策略）
 """
 
 import sys
@@ -8,22 +8,46 @@ import requests
 import json
 import os
 import re
-import gzip
-import base64
 import urllib3
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+import atexit
+import socket
+import struct
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta, timezone
 from crypto_core import generate_yStr
 from requests.adapters import HTTPAdapter
+from reqable_token import (
+    decode_jwt_payload,
+    find_reqable_capture_dir,
+    format_exp,
+    is_library_token_valid,
+    jwt_exp,
+    library_user_id,
+    scan_reqable_for_token,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG_PATH = 'user_data.json'
+BEIJING_TZ = timezone(timedelta(hours=8))
+TIME_OFFSET_SECONDS = 0.0
 
 
 # ====== 工具函数 ======
+def calibrated_time():
+    return time.time() + TIME_OFFSET_SECONDS
+
+
+def beijing_now():
+    return datetime.fromtimestamp(calibrated_time(), BEIJING_TZ)
+
+
+def format_beijing_timestamp(timestamp):
+    return datetime.fromtimestamp(timestamp, BEIJING_TZ).strftime('%H:%M:%S.%f')[:-3]
+
+
 def T():
-    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    return beijing_now().strftime('%H:%M:%S.%f')[:-3]
 
 
 def load_config():
@@ -31,16 +55,19 @@ def load_config():
         default_config = {
             "student_id": "202311100913",
             "password": "2017",
-            "target_date": (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'),
+            "target_date": (beijing_now() + timedelta(days=1)).strftime('%Y-%m-%d'),
             "auto_update_target_date": True,
             "seat_code": "301011A",
             "snipe_time": "22:30:00",
             "start_hour": "08:00:00",
             "end_hour": "22:00:00",
-            "first_bullet_advance_ms": 800,
-            "bullet_gap_ms": 150,
+            "fire_advance_ms": 0,
+            "time_sync_enabled": True,
+            "time_sync_servers": ["ntp.aliyun.com", "ntp.tencent.com", "ntp.ntsc.ac.cn", "time.windows.com"],
+            "time_sync_timeout": 1.0,
+            "time_sync_samples": 3,
             "snipe_cooldown": 3,
-            "snipe_interval": 0.8,
+            "snipe_interval": 5.2,
             "snipe_max": 99999,
             "request_timeout": 2
         }
@@ -62,10 +89,13 @@ def save_config(config):
 def ensure_config_defaults(config):
     defaults = {
         "auto_update_target_date": True,
-        "first_bullet_advance_ms": 800,
-        "bullet_gap_ms": 150,
+        "fire_advance_ms": 0,
+        "time_sync_enabled": True,
+        "time_sync_servers": ["ntp.aliyun.com", "ntp.tencent.com", "ntp.ntsc.ac.cn", "time.windows.com"],
+        "time_sync_timeout": 1.0,
+        "time_sync_samples": 3,
         "snipe_cooldown": 3,
-        "snipe_interval": 0.8,
+        "snipe_interval": 5.2,
         "snipe_max": 99999,
         "request_timeout": 2
     }
@@ -74,6 +104,13 @@ def ensure_config_defaults(config):
         if key not in config:
             config[key] = value
             changed = True
+    for legacy_key in ("first_bullet_advance_ms", "bullet_gap_ms"):
+        if legacy_key in config:
+            del config[legacy_key]
+            changed = True
+    if float(config.get("snipe_interval", 5.2)) < 5.2:
+        config["snipe_interval"] = 5.2
+        changed = True
     if changed:
         save_config(config)
     return config
@@ -84,7 +121,7 @@ def auto_fix_date(config):
         print(f"[{T()}] [*] 自动更新预约日期已关闭，预约日期按配置: {config.get('target_date')}")
         return config
 
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+    tomorrow = (beijing_now() + timedelta(days=1)).strftime('%Y-%m-%d')
     if config.get("target_date", "") != tomorrow:
         print(f"[{T()}] [*] 日期: {config.get('target_date')} -> {tomorrow}")
         config["target_date"] = tomorrow
@@ -92,137 +129,112 @@ def auto_fix_date(config):
     return config
 
 
-def decode_jwt_payload(token):
-    try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return None
-        payload = parts[1]
-        padding = 4 - len(payload) % 4
-        if padding != 4:
-            payload += '=' * padding
-        decoded = base64.urlsafe_b64decode(payload)
-        return json.loads(decoded)
-    except Exception:
-        return None
+# ====== 北京时间校准 ======
+def query_ntp_offset(server, timeout):
+    ntp_epoch_delta = 2208988800
+    transmit_time = time.time() + ntp_epoch_delta
+    transmit_seconds = int(transmit_time)
+    transmit_fraction = int((transmit_time - transmit_seconds) * 2 ** 32)
+    packet = bytearray(48)
+    packet[0] = 0x1b
+    struct.pack_into("!II", packet, 40, transmit_seconds, transmit_fraction)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        t0 = time.time()
+        sock.sendto(bytes(packet), (server, 123))
+        data, _ = sock.recvfrom(48)
+        t3 = time.time()
+    if len(data) < 48:
+        raise ValueError("NTP response too short")
+    values = struct.unpack("!12I", data[:48])
+    originate = values[6] + values[7] / 2 ** 32 - ntp_epoch_delta
+    receive = values[8] + values[9] / 2 ** 32 - ntp_epoch_delta
+    transmit = values[10] + values[11] / 2 ** 32 - ntp_epoch_delta
+    if originate <= 0:
+        originate = t0
+    delay = (t3 - t0) - (transmit - receive)
+    offset = ((receive - originate) + (transmit - t3)) / 2
+    return offset, max(0, delay)
 
 
-def is_jwt_valid(token):
-    if not token or len(token) < 100 or not token.startswith('eyJ'):
-        return False
-    payload = decode_jwt_payload(token)
-    if not payload:
-        return False
-    now = int(time.time())
+def query_http_date_offset(url, timeout):
+    started = time.time()
+    response = requests.head(url, timeout=timeout, verify=False, allow_redirects=False)
+    ended = time.time()
+    date_header = response.headers.get("Date")
+    if not date_header:
+        raise ValueError("missing Date header")
+    server_dt = parsedate_to_datetime(date_header)
+    server_ts = server_dt.timestamp()
+    midpoint = (started + ended) / 2
+    return server_ts - midpoint, ended - started
 
-    # 兼容不同字段名和毫秒级时间戳
-    exp = payload.get('exp') or payload.get('expiration') or payload.get('expire') or 0
-    if isinstance(exp, (int, float)):
-        if exp > 100000000000:  # 毫秒级
-            exp = exp // 1000
-    else:
-        exp = 0
 
-    is_valid = now < exp - 300
-    if not is_valid:
-        print(f"[{T()}] [!] Token 已过期 (exp={exp}, now={now})")
-        print(f"[{T()}] [!] Token payload: {json.dumps(payload, ensure_ascii=False)[:200]}")
-    return is_valid
+def calibrate_beijing_time(config):
+    global TIME_OFFSET_SECONDS
+    if not config.get("time_sync_enabled", True):
+        print(f"[{T()}] [*] 北京时间校准已关闭，使用本机时间")
+        return 0.0
+
+    timeout = float(config.get("time_sync_timeout", 1.0))
+    samples_per_server = max(1, int(config.get("time_sync_samples", 3)))
+    servers = config.get("time_sync_servers") or []
+    candidates = []
+
+    print(f"[{T()}] [*] 正在校准北京时间...")
+    for server in servers:
+        for _ in range(samples_per_server):
+            try:
+                offset, delay = query_ntp_offset(server, timeout)
+                candidates.append(("NTP", server, offset, delay))
+            except Exception:
+                continue
+
+    if not candidates:
+        for url in ("https://www.baidu.com/", "https://www.qq.com/", "https://www.microsoft.com/"):
+            try:
+                offset, delay = query_http_date_offset(url, timeout)
+                candidates.append(("HTTP", url, offset, delay))
+            except Exception:
+                continue
+
+    if not candidates:
+        print(f"[{T()}] [!] 北京时间校准失败，继续使用本机时间")
+        return 0.0
+
+    method, source, offset, delay = min(candidates, key=lambda item: item[3])
+    TIME_OFFSET_SECONDS = offset
+    print(
+        f"[{T()}] [*] 北京时间校准完成: {method} {source} | "
+        f"本机偏差 {offset * 1000:+.1f}ms | 延迟 {delay * 1000:.1f}ms"
+    )
+    return offset
 
 
 # ====== Reqable 抓包 Token 提取 ======
-def find_reqable_capture_dir():
-    candidates = []
-    appdata = os.environ.get('APPDATA', '')
-    if appdata:
-        candidates.append(os.path.join(appdata, 'Reqable', 'capture'))
-    localappdata = os.environ.get('LOCALAPPDATA', '')
-    if localappdata:
-        candidates.append(os.path.join(localappdata, 'Reqable', 'capture'))
-    for path in candidates:
-        if os.path.isdir(path):
-            return path
-    return None
-
-
-def decode_body(data):
-    try:
-        return data.decode('utf-8')
-    except UnicodeDecodeError:
-        pass
-    try:
-        return gzip.decompress(data).decode('utf-8')
-    except Exception:
-        return None
-
-
-def extract_token_from_text(text):
-    try:
-        obj = json.loads(text)
-        for key in ['token', 'access_token', 'accessToken', 'Token']:
-            val = obj.get(key)
-            if val and len(str(val)) > 20:
-                return val
-            if 'data' in obj and isinstance(obj['data'], dict):
-                val = obj['data'].get(key)
-                if val and len(str(val)) > 20:
-                    return val
-    except Exception:
-        pass
-    jwt_match = re.search(r'eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+', text)
-    if jwt_match:
-        return jwt_match.group(0)
-    return None
-
-
-def fetch_token_from_reqable(capture_dir):
-    body_files = []
-    for f in os.listdir(capture_dir):
-        if f.endswith('.reqable') and 'res-raw-body' in f:
-            fp = os.path.join(capture_dir, f)
-            body_files.append((os.path.getmtime(fp), fp, f))
-    if not body_files:
-        return None
-    body_files.sort(reverse=True)
-    for mtime, fp, fname in body_files[:200]:
-        size = os.path.getsize(fp)
-        if size == 0 or size > 500000:
-            continue
-        try:
-            data = open(fp, 'rb').read()
-            text = decode_body(data)
-            if text is None:
-                continue
-            token = extract_token_from_text(text)
-            if token:
-                if token.startswith('eyJ') or (isinstance(decode_jwt_payload(token), dict) and decode_jwt_payload(token).get('exp')):
-                    return token
-                try:
-                    if isinstance(json.loads(text), dict):
-                        obj = json.loads(text)
-                        for key in ['token', 'Token']:
-                            val = obj.get(key) or obj.get('data', {}).get(key)
-                            if val and len(str(val)) > 20:
-                                return val
-                except Exception:
-                    pass
-        except Exception:
-            continue
-    return None
-
-
 def auto_get_token(config):
     existing = config.get("token", "")
-    cfg_student_id = config.get("student_id", "")
-    if is_jwt_valid(existing):
+    cfg_student_id = str(config.get("student_id", ""))
+
+    if is_library_token_valid(existing, expected_user_id=cfg_student_id):
+        payload = decode_jwt_payload(existing)
+        exp = jwt_exp(payload) if payload else 0
+        print(f"[{T()}] [*] 现有 Token 有效且账号匹配，复用 (exp: {format_exp(exp)})")
+        return existing
+
+    if existing:
         payload = decode_jwt_payload(existing)
         if payload:
-            token_uid = str(payload.get("userId", ""))
-            if token_uid == cfg_student_id:
-                print(f"[{T()}] [*] 现有 Token 有效且账号匹配，复用")
-                return existing
-            else:
+            token_uid = library_user_id(payload)
+            exp = jwt_exp(payload)
+            if token_uid and token_uid != cfg_student_id:
                 print(f"[{T()}] [*] 账号已变更 ({token_uid} -> {cfg_student_id})，重新抓取")
+            elif token_uid:
+                print(f"[{T()}] [!] 现有 Token 已过期或即将过期 (exp: {format_exp(exp)})")
+            else:
+                print(f"[{T()}] [!] 现有 Token 不是图书馆 Token，重新抓取")
+        else:
+            print(f"[{T()}] [!] 现有 Token 无法解析，重新抓取")
 
     print(f"[{T()}] [*] 尝试从 Reqable 抓包获取 Token...")
     capture_dir = find_reqable_capture_dir()
@@ -230,18 +242,34 @@ def auto_get_token(config):
         print(f"[{T()}] [X] 找不到 Reqable 抓包目录")
         print(f"[{T()}] [X] 请确保：1. 打开 Reqable  2. 打开微信一点通  3. 小程序加载完成")
         return None
-    token = fetch_token_from_reqable(capture_dir)
+
+    scan_result = scan_reqable_for_token(capture_dir, expected_user_id=cfg_student_id)
+    print(
+        f"[{T()}] [*] Reqable扫描: 文件 {scan_result['scanned']}/{scan_result['total_files']} | "
+        f"候选 {scan_result['token_candidates']} | 图书馆JWT {scan_result['library_candidates']}"
+    )
+
+    token = scan_result.get("token")
     if not token:
-        print(f"[{T()}] [X] 未从抓包中找到有效 Token")
-        print(f"[{T()}] [X] 请确保一点通小程序已成功加载")
+        print(f"[{T()}] [X] 未从抓包中找到有效的图书馆 Token")
+        best_expired = scan_result.get("best_expired")
+        if best_expired:
+            print(f"[{T()}] [X] 最近匹配到的图书馆 Token 已过期: {format_exp(best_expired['exp'])}")
+            print(f"[{T()}] [X] 来源文件: {best_expired['source']}")
+        if scan_result.get("mismatched_library_tokens"):
+            print(f"[{T()}] [X] 发现其他账号的图书馆 Token: {scan_result['mismatched_library_tokens']} 个")
+        if scan_result.get("other_jwts"):
+            print(f"[{T()}] [*] 已忽略非图书馆 JWT: {scan_result['other_jwts']} 个")
+        print(f"[{T()}] [X] 请重新打开一点通并确认已经重新登录，再运行脚本")
         return None
+
     payload = decode_jwt_payload(token)
     if payload:
-        token_uid = str(payload.get("userId", ""))
+        token_uid = library_user_id(payload)
         if token_uid != cfg_student_id:
             print(f"[{T()}] [!] 警告: 抓到的 Token 用户({token_uid}) 与配置学号({cfg_student_id}) 不一致")
             print(f"[{T()}] [!] 请确保一点通登录的是正确的账号")
-    print(f"[{T()}] [*] 抓包获取 Token 成功: {token[:40]}...")
+    print(f"[{T()}] [*] 抓包获取 Token 成功: {token[:40]}... (exp: {format_exp(scan_result.get('exp', 0))})")
     config["token"] = token
     with open('user_data.json', 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
@@ -252,22 +280,17 @@ def auto_get_token(config):
 def make_session():
     s = requests.Session()
     s.verify = False
+    s.trust_env = False
     s.proxies.update({"http": None, "https": None})
-    adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0, pool_block=False)
+    adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0, pool_block=False)
     s.mount('https://', adapter)
     return s
 
 
 def warm_up(session):
-    """提前建立 SSL 连接"""
+    """提前建立同一个 Session 的 HTTPS 连接"""
     try:
-        import socket, ssl
-        sock = socket.create_connection(("tsg77.sdust.edu.cn", 443), timeout=3)
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        ssock = context.wrap_socket(sock, server_hostname="tsg77.sdust.edu.cn")
-        ssock.close()
+        session.get("https://tsg77.sdust.edu.cn/", timeout=3, verify=False)
     except Exception:
         pass
 
@@ -282,7 +305,7 @@ def do_book(session, token, user_id, raw_payload, request_timeout):
         "Content-Type": "application/json",
         "OperateTime": str(ts),
         "xweb_xhr": "1",
-        "Connection": "close"
+        "Connection": "keep-alive"
     }
     try:
         r = session.post("https://tsg77.sdust.edu.cn/Order/OrderSeat",
@@ -305,14 +328,39 @@ def extract_uid(token):
 
 
 # ====== 精确计时器 ======
-def sleep_until(target_timestamp):
-    """busy-wait 精确到 ~1ms"""
-    now = time.time()
-    diff = target_timestamp - now
-    if diff > 0.2:
-        time.sleep(diff - 0.2)
-    while time.time() < target_timestamp:
+def enable_high_resolution_timer():
+    """Windows 下提高 sleep 精度，失败不影响主流程。"""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        winmm = ctypes.WinDLL('winmm')
+        if winmm.timeBeginPeriod(1) == 0:
+            atexit.register(lambda: winmm.timeEndPeriod(1))
+    except Exception:
         pass
+
+
+def make_deadline(target_timestamp):
+    return time.perf_counter() + max(0, target_timestamp - calibrated_time())
+
+
+def sleep_until_deadline(deadline):
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        if remaining > 0.25:
+            time.sleep(remaining - 0.2)
+        elif remaining > 0.02:
+            time.sleep(remaining / 2)
+        else:
+            pass
+
+
+def sleep_until(target_timestamp):
+    """按本地墙钟时间触发，最后一小段用 perf_counter 抗系统时间抖动。"""
+    sleep_until_deadline(make_deadline(target_timestamp))
 
 
 def is_cancel_pressed():
@@ -328,61 +376,91 @@ def is_cancel_pressed():
 
 
 def sleep_until_with_cancel(target_timestamp):
+    deadline = make_deadline(target_timestamp)
     while True:
-        remaining = target_timestamp - time.time()
+        remaining = deadline - time.perf_counter()
         if remaining <= 0.25:
             break
         if is_cancel_pressed():
             return False
         time.sleep(min(remaining - 0.2, 1))
-    sleep_until(target_timestamp)
+    sleep_until_deadline(deadline)
     return True
 
 
-def fire_bullet(label, session, token, uid, raw_payload, request_timeout, planned_ts, snipe_ts):
+def sleep_seconds_with_cancel(seconds):
+    target = time.perf_counter() + max(0, seconds)
+    while True:
+        remaining = target - time.perf_counter()
+        if remaining <= 0:
+            return True
+        if is_cancel_pressed():
+            return False
+        time.sleep(min(remaining, 0.2))
+
+
+def parse_retry_seconds(msg):
+    match = re.search(r'(\d+(?:\.\d+)?)\s*秒后', msg or '')
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def calc_next_retry_wait(msg, fallback_interval):
+    retry_seconds = parse_retry_seconds(msg)
+    if retry_seconds is None:
+        return fallback_interval
+    return max(fallback_interval, retry_seconds + 0.3)
+
+
+def fire_once(label, session, token, uid, raw_payload, request_timeout, planned_ts, snipe_ts):
     sleep_until(planned_ts)
-    sent_at = time.time()
+    sent_at = calibrated_time()
+    started = time.perf_counter()
     ok, msg = do_book(session, token, uid, raw_payload, request_timeout)
+    latency = time.perf_counter() - started
     short_msg = msg[:40] + "..." if len(msg) > 40 else msg
     elapsed = sent_at - snipe_ts
     status = "OK" if ok else "X"
-    print(f"[{T()}] [{status}] {label}({elapsed:+.3f}s): {short_msg}")
+    sent_text = format_beijing_timestamp(sent_at)
+    print(f"[{T()}] [{status}] {label}: 发出 {sent_text} ({elapsed:+.3f}s), 响应 {latency:.3f}s | {short_msg}")
     return ok, msg
 
 
 def get_snipe_datetime(target_date, snipe_time):
     target_day = datetime.strptime(target_date, "%Y-%m-%d")
     snipe_clock = datetime.strptime(snipe_time, "%H:%M:%S").time()
-    return datetime.combine(target_day - timedelta(days=1), snipe_clock)
+    return datetime.combine(target_day - timedelta(days=1), snipe_clock, tzinfo=BEIJING_TZ)
 
-
-# ====== 入口 ======
-config = ensure_config_defaults(load_config())
-config = auto_fix_date(config)
-
-SEAT_CODE = config["seat_code"]
-ROOM_CODE = SEAT_CODE[:3]
-SNIPE_TIME = config["snipe_time"]
-TARGET_START = f"{config['target_date']}T{config['start_hour']}.000Z"
-TARGET_END = f"{config['target_date']}T{config['end_hour']}.000Z"
-
-# 策略参数
-FIRST_BULLET_ADVANCE_MS = int(config.get("first_bullet_advance_ms", 800))
-BULLET_GAP_MS = int(config.get("bullet_gap_ms", 150))
-SNIPE_COOLDOWN = float(config.get("snipe_cooldown", 3))
-SNIPE_INTERVAL = float(config.get("snipe_interval", 0.8))
-SNIPE_MAX = int(config.get("snipe_max", 99999))
-REQUEST_TIMEOUT = float(config.get("request_timeout", 2))
 
 if __name__ == "__main__":
+    enable_high_resolution_timer()
+
+    config = ensure_config_defaults(load_config())
+    calibrate_beijing_time(config)
+    config = auto_fix_date(config)
+
+    SEAT_CODE = config["seat_code"]
+    ROOM_CODE = SEAT_CODE[:3]
+    SNIPE_TIME = config["snipe_time"]
+    TARGET_START = f"{config['target_date']}T{config['start_hour']}.000Z"
+    TARGET_END = f"{config['target_date']}T{config['end_hour']}.000Z"
+
+    FIRE_ADVANCE_MS = int(config.get("fire_advance_ms", 0))
+    SNIPE_COOLDOWN = float(config.get("snipe_cooldown", 3))
+    SNIPE_INTERVAL = max(5.2, float(config.get("snipe_interval", 5.2)))
+    SNIPE_MAX = int(config.get("snipe_max", 99999))
+    REQUEST_TIMEOUT = float(config.get("request_timeout", 2))
+
     snipe_dt = get_snipe_datetime(config["target_date"], SNIPE_TIME)
     snipe_ts = snipe_dt.timestamp()
     snipe_text = snipe_dt.strftime("%Y-%m-%d %H:%M:%S")
+    fire_ts = snipe_ts - (FIRE_ADVANCE_MS / 1000)
 
     print(
         f"[{T()}] 目标: {SEAT_CODE} | 预约日期: {config['target_date']} | "
         f"时段: {config['start_hour']}-{config['end_hour']} | 开抢: {snipe_text} | "
-        f"2发连射(提前{FIRST_BULLET_ADVANCE_MS}ms, 间隔{BULLET_GAP_MS}ms)"
+        f"准点单发(提前{FIRE_ADVANCE_MS}ms)"
     )
 
     # === Token ===
@@ -400,63 +478,67 @@ if __name__ == "__main__":
            "dtStart": TARGET_START, "dtEnd": TARGET_END, "remark": ""}
 
     # === 预热 ===
-    sessions = [make_session(), make_session()]
-    for s in sessions:
-        warm_up(s)
+    session = make_session()
+    warm_up(session)
     print(f"[{T()}] 连接预热完成")
 
     # === 倒计时到整点 ===
-    now_ts = time.time()
+    now_ts = calibrated_time()
     wait_seconds = snipe_ts - now_ts
 
     if wait_seconds < 0:
         print(f"[{T()}] [!] 开抢时间 {snipe_text} 已过，立即执行并进入捡漏策略")
         snipe_ts = now_ts
+        fire_ts = now_ts
         wait_seconds = 0
 
     if wait_seconds > 0:
         print(f"[{T()}] 倒计时 {wait_seconds:.0f}s 至 {snipe_text}（回车可取消）...")
-        first_fire_ts = snipe_ts - (FIRST_BULLET_ADVANCE_MS / 1000)
-        if not sleep_until_with_cancel(first_fire_ts):
+        if not sleep_until_with_cancel(fire_ts):
             print(f"[{T()}] [*] 已取消")
             exit()
 
-    # === 开火！第一发（提前发出，让请求在服务器队列里排队）===
-    print(f"[{T()}] 开抢！2发先后发射 (提前{FIRST_BULLET_ADVANCE_MS}ms)")
+    # === 准点单发 ===
+    print(f"[{T()}] 开抢！准点单发")
     done = False
-
-    first_fire_ts = snipe_ts - (FIRST_BULLET_ADVANCE_MS / 1000)
-    second_fire_ts = first_fire_ts + (BULLET_GAP_MS / 1000)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [
-            executor.submit(fire_bullet, "第一发", sessions[0], token, uid, raw, REQUEST_TIMEOUT, first_fire_ts, snipe_ts),
-            executor.submit(fire_bullet, "第二发", sessions[1], token, uid, raw, REQUEST_TIMEOUT, second_fire_ts, snipe_ts),
-        ]
-        for future in as_completed(futures):
-            ok, _ = future.result()
-            if ok:
-                done = True
+    ok, last_msg = fire_once("首发", session, token, uid, raw, REQUEST_TIMEOUT, fire_ts, snipe_ts)
+    if ok:
+        done = True
 
     # === 捡漏 ===
     if not done:
-        print(f"[{T()}] 冷静 {SNIPE_COOLDOWN}s 后进入捡漏...")
-        time.sleep(SNIPE_COOLDOWN)
+        wait_after_first = max(SNIPE_COOLDOWN, calc_next_retry_wait(last_msg, SNIPE_INTERVAL))
+        print(f"[{T()}] 冷静 {wait_after_first:.1f}s 后进入捡漏...")
+        if not sleep_seconds_with_cancel(wait_after_first):
+            print(f"[{T()}] [*] 已取消")
+            exit()
 
         print(f"[{T()}] [X] 进入捡漏模式 ({SNIPE_INTERVAL}s/次，上限{SNIPE_MAX}次，回车取消)...")
+        next_wait = 0
         for i in range(SNIPE_MAX):
             if is_cancel_pressed():
                 print(f"[{T()}] [*] 已取消捡漏")
                 break
 
-            time.sleep(SNIPE_INTERVAL)
-            ok, msg = do_book(sessions[0], token, uid, raw, REQUEST_TIMEOUT)
+            if next_wait > 0 and not sleep_seconds_with_cancel(next_wait):
+                print(f"[{T()}] [*] 已取消捡漏")
+                break
+
+            sent_at = calibrated_time()
+            started = time.perf_counter()
+            ok, msg = do_book(session, token, uid, raw, REQUEST_TIMEOUT)
+            latency = time.perf_counter() - started
             short_msg = msg[:40] + "..." if len(msg) > 40 else msg
             status = "OK" if ok else "X"
-            print(f"[{T()}] [{status}] 捡漏{i+1}: {short_msg}")
+            sent_text = format_beijing_timestamp(sent_at)
+            print(f"[{T()}] [{status}] 捡漏{i+1}: 发出 {sent_text}, 响应 {latency:.3f}s | {short_msg}")
             if ok:
                 done = True
                 print(f"[{T()}] [OK] 捡漏成功！")
                 break
+            next_wait = calc_next_retry_wait(msg, SNIPE_INTERVAL)
+            if next_wait > SNIPE_INTERVAL:
+                print(f"[{T()}] [*] 触发频控提示，下次捡漏等待 {next_wait:.1f}s")
 
     if done:
         print(f"[{T()}] [OK] 抢座成功！")

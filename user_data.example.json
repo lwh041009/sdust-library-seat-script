@@ -8,10 +8,18 @@
     "snipe_time": "22:30:00",
     "start_hour": "09:00:00",
     "end_hour": "22:00:00",
-    "first_bullet_advance_ms": 800,
-    "bullet_gap_ms": 150,
+    "fire_advance_ms": 0,
+    "time_sync_enabled": true,
+    "time_sync_servers": [
+        "ntp.aliyun.com",
+        "ntp.tencent.com",
+        "ntp.ntsc.ac.cn",
+        "time.windows.com"
+    ],
+    "time_sync_timeout": 1.0,
+    "time_sync_samples": 3,
     "snipe_cooldown": 3,
-    "snipe_interval": 0.8,
+    "snipe_interval": 5.2,
     "snipe_max": 99999,
     "request_timeout": 2
 }

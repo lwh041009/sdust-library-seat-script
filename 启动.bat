@@ -4,6 +4,6 @@ chcp 65001
 cd /d %~dp0
 
 echo 正在启动 图书馆抢座引擎...
-"D:\anaconda3\python.exe" main.py
+python main.py
 
 pause
