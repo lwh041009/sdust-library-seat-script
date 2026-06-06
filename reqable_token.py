@@ -9,6 +9,7 @@ import os
 import re
 import time
 import zlib
+from heapq import heappush, heapreplace
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +20,7 @@ TOKEN_FIELD_RE = re.compile(
 )
 BEARER_RE = re.compile(r"Bearer\s+([A-Za-z0-9._~+/=-]{20,})", re.IGNORECASE)
 HEADER_TOKEN_RE = re.compile(r"(?im)^\s*Token\s*:\s*([A-Za-z0-9._~+/=-]{20,})\s*$")
+TOKEN_HINTS = (b"eyJ", b"Token", b"token", b"Bearer", b"access_token", b"accessToken", b"id_token")
 
 
 def find_reqable_capture_dir():
@@ -196,7 +198,7 @@ def extract_token_candidates(text):
 def scan_reqable_for_token(
     capture_dir,
     expected_user_id=None,
-    scan_limit=1200,
+    scan_limit=300,
     max_file_size=2_000_000,
     min_seconds=300,
 ):
@@ -215,24 +217,43 @@ def scan_reqable_for_token(
         "other_jwts": 0,
         "opaque_tokens": 0,
         "best_expired": None,
+        "elapsed_seconds": 0.0,
     }
 
+    started = time.perf_counter()
     root = Path(capture_dir)
     if not root.is_dir():
         return result
 
-    files = [path for path in root.rglob("*.reqable") if path.is_file()]
-    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    result["total_files"] = len(files)
+    recent_files = []
+    total_files = 0
+    try:
+        entries = os.scandir(root)
+    except OSError:
+        return result
+
+    with entries:
+        for entry in entries:
+            if not entry.is_file() or not entry.name.endswith(".reqable"):
+                continue
+            total_files += 1
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            item = (stat.st_mtime, stat.st_size, Path(entry.path))
+            if len(recent_files) < scan_limit:
+                heappush(recent_files, item)
+            elif item[0] > recent_files[0][0]:
+                heapreplace(recent_files, item)
+
+    result["total_files"] = total_files
+    files = sorted(recent_files, key=lambda item: item[0], reverse=True)
 
     seen_tokens = set()
     now = time.time()
 
-    for path in files[:scan_limit]:
-        try:
-            size = path.stat().st_size
-        except OSError:
-            continue
+    for _, size, path in files:
         if size == 0:
             continue
         if size > max_file_size:
@@ -241,9 +262,12 @@ def scan_reqable_for_token(
 
         result["scanned"] += 1
         try:
-            text = decode_body(path.read_bytes())
+            data = path.read_bytes()
         except Exception:
             continue
+        if not any(hint in data for hint in TOKEN_HINTS):
+            continue
+        text = decode_body(data)
         if not text:
             continue
 
@@ -279,6 +303,8 @@ def scan_reqable_for_token(
             result["token"] = token
             result["source"] = rel
             result["exp"] = exp
+            result["elapsed_seconds"] = time.perf_counter() - started
             return result
 
+    result["elapsed_seconds"] = time.perf_counter() - started
     return result

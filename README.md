@@ -12,8 +12,11 @@
 - 可自动把预约日期更新为明天，也可关闭后手动指定日期。
 - 支持配置座位号、预约日期、预约时段、开抢时间。
 - 支持 NTP/HTTP 北京时间校准，不修改系统时间。
+- 校时请求会并行采样，避免多个服务器顺序超时导致启动卡住。
 - 支持准点单发，失败后按间隔自动捡漏。
 - 捡漏间隔会自动限制为至少 `5.2` 秒，降低触发“操作频繁”的概率。
+- 每次运行会在 `logs/` 目录生成 UTF-8 日志文件，方便回看首发和捡漏结果。
+- 等待开抢时，控制台会每秒刷新倒计时；按回车可以取消。
 
 ## 文件说明
 
@@ -21,11 +24,13 @@
 main.py              主程序：读取配置、校时、获取 Token、定时提交预约
 token_refresher.py   单独刷新 Token 的工具
 reqable_token.py     Reqable 抓包目录查找、Token 扫描、JWT 校验工具
+cleanup_reqable_capture.py 清理 Reqable 旧抓包文件的工具，默认只预览
 crypto_core.py       加密和 yStr 生成逻辑
 login.py             登录接口尝试工具，目前主流程主要依赖 Reqable 抓包 Token
 user_data.json       个人配置文件，包含账号、Token 等敏感信息，不要上传
 user_data.example.json 配置示例文件
 启动.bat             Windows 一键启动脚本
+logs/               每次运行生成的日志文件目录
 ```
 
 ## 环境要求
@@ -100,7 +105,7 @@ pip install requests urllib3 pycryptodome
 | `time_sync_timeout` | 单次校时超时时间，单位秒 |
 | `time_sync_samples` | 每个 NTP 服务器采样次数，脚本会优先采用网络延迟最低的一次 |
 | `snipe_cooldown` | 首发失败后，等待几秒进入捡漏 |
-| `snipe_interval` | 捡漏请求间隔，脚本会自动限制为至少 5.2 秒 |
+| `snipe_interval` | 捡漏请求间隔，脚本会自动限制为至少 `5.2` 秒 |
 | `snipe_max` | 最大捡漏次数 |
 | `request_timeout` | 单次预约请求超时时间，单位秒 |
 
@@ -172,6 +177,35 @@ python main.py
 python token_refresher.py
 ```
 
+清理 Reqable 旧抓包文件：
+
+```bash
+python cleanup_reqable_capture.py
+```
+
+默认只预览，不会删除。确认后再执行：
+
+```bash
+python cleanup_reqable_capture.py --keep-hours 24 --delete
+```
+
+## 日志文件
+
+`main.py` 每次启动都会创建一个日志文件：
+
+```text
+logs/年月日_时分秒.log
+```
+
+窗口里显示的内容会同步写入这个文件。遇到乱码、首发失败、返回“操作频繁”或没抢到时，优先打开最新的日志文件查看：
+
+```text
+日志文件: D:\...\logs\20260604_223000.log
+首发: 发出 22:30:00.000 (+0.000s), 响应 0.123s | ...
+```
+
+日志文件使用 UTF-8 编码。如果窗口仍然乱码，以 `logs/` 里的文件内容为准。
+
 ## 推荐使用流程
 
 1. 打开 Reqable。
@@ -218,5 +252,13 @@ python token_refresher.py
 ```
 
 括号里的值越接近 `+0.000s`，说明越贴近准点。正数代表晚于开抢时间，负数代表提前发送；如果配置了 `fire_advance_ms`，出现对应的负数是正常的。
-### 问题反馈
-邮箱：lwh041009@gmail.com
+
+## 上传 GitHub 前注意
+
+不要上传包含真实账号信息的 `user_data.json`。其中可能包含：
+
+- 学号
+- 密码
+- Token
+
+建议只上传脱敏示例文件，例如 `user_data.example.json`，并把真实的 `user_data.json` 放入 `.gitignore`。

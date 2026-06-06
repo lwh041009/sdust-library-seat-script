@@ -16,11 +16,13 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAujYRr588K81myBk+meKCd3yp1MbFP421B0nf
 # 注意：AES 必须是 bytes 类型
 AES_KEY = b"YDT64760YDT64760YDT64760YDT64760"  # 32位，AES-256
 AES_IV = b"YDT60900YDT60900"  # 16位
+RSA_KEY = RSA.importKey(RSA_PUBLIC_KEY)
+RSA_CIPHER = PKCS1_v1_5.new(RSA_KEY)
 
 
 # ----------------------------------------
 
-def generate_yStr(payload_dict):
+def generate_yStr(payload_dict, timestamp=None):
     """
     核心加密逻辑：将请求体字典转换为带动态时间戳的 RSA 密文 (yStr)
 
@@ -28,19 +30,15 @@ def generate_yStr(payload_dict):
     :return: tuple(str, int), 返回 (Base64密文字符串, 注入的秒级时间戳)
     """
     # 1. 动态注入时间戳 (防重放机制)
-    current_time_sec = int(time.time())
+    current_time_sec = int(time.time() if timestamp is None else timestamp)
     payload_dict['yOp'] = current_time_sec
 
     # 2. 序列化为紧凑的 JSON 字符串
     json_str = json.dumps(payload_dict, separators=(',', ':'))
 
-    # 3. 导入 RSA 公钥并进行 PKCS1_v1_5 加密
-    key = RSA.importKey(RSA_PUBLIC_KEY)
-    cipher = PKCS1_v1_5.new(key)
-
-    # 4. 执行加密并进行 Base64 编码
+    # 3. 执行加密并进行 Base64 编码
     msg_bytes = json_str.encode('utf-8')
-    encrypted_bytes = cipher.encrypt(msg_bytes)
+    encrypted_bytes = RSA_CIPHER.encrypt(msg_bytes)
     base64_str = base64.b64encode(encrypted_bytes).decode('utf-8')
 
     return base64_str, current_time_sec

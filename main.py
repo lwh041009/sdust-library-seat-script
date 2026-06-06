@@ -12,6 +12,8 @@ import urllib3
 import atexit
 import socket
 import struct
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from crypto_core import generate_yStr
@@ -29,11 +31,82 @@ from reqable_token import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG_PATH = 'user_data.json'
+LOG_DIR = 'logs'
 BEIJING_TZ = timezone(timedelta(hours=8))
 TIME_OFFSET_SECONDS = 0.0
+LOG_HANDLE = None
 
 
 # ====== 工具函数 ======
+class TeeOutput:
+    def __init__(self, *streams):
+        self.streams = streams
+        self.encoding = "utf-8"
+
+    def write(self, text):
+        for stream in self.streams:
+            if getattr(stream, "closed", False):
+                continue
+            try:
+                stream.write(text)
+                stream.flush()
+            except Exception:
+                continue
+
+    def flush(self):
+        for stream in self.streams:
+            if getattr(stream, "closed", False):
+                continue
+            try:
+                stream.flush()
+            except Exception:
+                continue
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+def setup_console_encoding():
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["cmd", "/c", "chcp", "65001"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+
+
+def setup_logging():
+    global LOG_HANDLE
+    setup_console_encoding()
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_name = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S.log")
+    log_path = os.path.abspath(os.path.join(LOG_DIR, log_name))
+    LOG_HANDLE = open(log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = TeeOutput(sys.__stdout__, LOG_HANDLE)
+    sys.stderr = TeeOutput(sys.__stderr__, LOG_HANDLE)
+    atexit.register(shutdown_logging)
+    print(f"[{T()}] [*] 日志文件: {log_path}")
+    return log_path
+
+
+def shutdown_logging():
+    global LOG_HANDLE
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    if LOG_HANDLE and not LOG_HANDLE.closed:
+        LOG_HANDLE.close()
+    LOG_HANDLE = None
+
+
 def calibrated_time():
     return time.time() + TIME_OFFSET_SECONDS
 
@@ -44,6 +117,10 @@ def beijing_now():
 
 def format_beijing_timestamp(timestamp):
     return datetime.fromtimestamp(timestamp, BEIJING_TZ).strftime('%H:%M:%S.%f')[:-3]
+
+
+def format_beijing_datetime(timestamp):
+    return datetime.fromtimestamp(timestamp, BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def T():
@@ -170,6 +247,25 @@ def query_http_date_offset(url, timeout):
     return server_ts - midpoint, ended - started
 
 
+def collect_time_candidates(tasks, max_workers):
+    candidates = []
+    if not tasks:
+        return candidates
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_meta = {}
+        for method, source, func, timeout in tasks:
+            future = executor.submit(func, source, timeout)
+            future_meta[future] = (method, source)
+        for future in as_completed(future_meta):
+            method, source = future_meta[future]
+            try:
+                offset, delay = future.result()
+                candidates.append((method, source, offset, delay))
+            except Exception:
+                continue
+    return candidates
+
+
 def calibrate_beijing_time(config):
     global TIME_OFFSET_SECONDS
     if not config.get("time_sync_enabled", True):
@@ -179,24 +275,20 @@ def calibrate_beijing_time(config):
     timeout = float(config.get("time_sync_timeout", 1.0))
     samples_per_server = max(1, int(config.get("time_sync_samples", 3)))
     servers = config.get("time_sync_servers") or []
-    candidates = []
 
     print(f"[{T()}] [*] 正在校准北京时间...")
-    for server in servers:
-        for _ in range(samples_per_server):
-            try:
-                offset, delay = query_ntp_offset(server, timeout)
-                candidates.append(("NTP", server, offset, delay))
-            except Exception:
-                continue
+    started = time.perf_counter()
+    ntp_tasks = [
+        ("NTP", server, query_ntp_offset, timeout)
+        for server in servers
+        for _ in range(samples_per_server)
+    ]
+    candidates = collect_time_candidates(ntp_tasks, max_workers=min(16, max(1, len(ntp_tasks))))
 
     if not candidates:
-        for url in ("https://www.baidu.com/", "https://www.qq.com/", "https://www.microsoft.com/"):
-            try:
-                offset, delay = query_http_date_offset(url, timeout)
-                candidates.append(("HTTP", url, offset, delay))
-            except Exception:
-                continue
+        http_urls = ("https://www.baidu.com/", "https://www.qq.com/", "https://www.microsoft.com/")
+        http_tasks = [("HTTP", url, query_http_date_offset, timeout) for url in http_urls]
+        candidates = collect_time_candidates(http_tasks, max_workers=min(16, len(http_tasks)))
 
     if not candidates:
         print(f"[{T()}] [!] 北京时间校准失败，继续使用本机时间")
@@ -206,7 +298,8 @@ def calibrate_beijing_time(config):
     TIME_OFFSET_SECONDS = offset
     print(
         f"[{T()}] [*] 北京时间校准完成: {method} {source} | "
-        f"本机偏差 {offset * 1000:+.1f}ms | 延迟 {delay * 1000:.1f}ms"
+        f"本机偏差 {offset * 1000:+.1f}ms | 延迟 {delay * 1000:.1f}ms | "
+        f"耗时 {time.perf_counter() - started:.2f}s"
     )
     return offset
 
@@ -246,7 +339,8 @@ def auto_get_token(config):
     scan_result = scan_reqable_for_token(capture_dir, expected_user_id=cfg_student_id)
     print(
         f"[{T()}] [*] Reqable扫描: 文件 {scan_result['scanned']}/{scan_result['total_files']} | "
-        f"候选 {scan_result['token_candidates']} | 图书馆JWT {scan_result['library_candidates']}"
+        f"候选 {scan_result['token_candidates']} | 图书馆JWT {scan_result['library_candidates']} | "
+        f"耗时 {scan_result.get('elapsed_seconds', 0):.2f}s"
     )
 
     token = scan_result.get("token")
@@ -296,7 +390,9 @@ def warm_up(session):
 
 
 def do_book(session, token, user_id, raw_payload, request_timeout):
-    yStr, ts = generate_yStr(raw_payload.copy())
+    crypto_started = time.perf_counter()
+    yStr, ts = generate_yStr(raw_payload.copy(), timestamp=calibrated_time())
+    crypto_latency = time.perf_counter() - crypto_started
     headers = {
         "Host": "tsg77.sdust.edu.cn",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 MicroMessenger/7.0.20.1781",
@@ -307,17 +403,35 @@ def do_book(session, token, user_id, raw_payload, request_timeout):
         "xweb_xhr": "1",
         "Connection": "keep-alive"
     }
+    post_started_at = calibrated_time()
+    started = time.perf_counter()
     try:
         r = session.post("https://tsg77.sdust.edu.cn/Order/OrderSeat",
                          headers=headers, json={"yStr": yStr},
                          timeout=request_timeout, verify=False)
+        latency = time.perf_counter() - started
         data = r.json()
         msg = data.get('message', '')
         code = data.get('code')
         ok = (code == 0) or (msg and "已有预约" in msg)
-        return ok, msg
+        meta = {
+            "post_started_at": post_started_at,
+            "crypto_latency": crypto_latency,
+            "latency": latency,
+            "http_status": r.status_code,
+            "code": code,
+        }
+        return ok, msg, meta
     except Exception as e:
-        return False, str(e)
+        latency = time.perf_counter() - started
+        meta = {
+            "post_started_at": post_started_at,
+            "crypto_latency": crypto_latency,
+            "latency": latency,
+            "http_status": None,
+            "code": None,
+        }
+        return False, str(e), meta
 
 
 def extract_uid(token):
@@ -325,6 +439,18 @@ def extract_uid(token):
     if payload:
         return payload.get("userId")
     return None
+
+
+def warn_if_token_expires_before_snipe(token, snipe_ts, buffer_seconds=300):
+    payload = decode_jwt_payload(token)
+    exp = jwt_exp(payload) if payload else 0
+    if not exp:
+        print(f"[{T()}] [!] Token 没有可识别的过期时间，不能保证开抢时有效")
+        return
+    if exp <= snipe_ts + buffer_seconds:
+        print(f"[{T()}] [!] Token 会在开抢前过期")
+        print(f"[{T()}] [!] Token 过期: {format_beijing_datetime(exp)} | 开抢: {format_beijing_datetime(snipe_ts)}")
+        print(f"[{T()}] [!] 测试倒计时可以继续；真正抢座前请重新打开一点通刷新 Token")
 
 
 # ====== 精确计时器 ======
@@ -363,6 +489,27 @@ def sleep_until(target_timestamp):
     sleep_until_deadline(make_deadline(target_timestamp))
 
 
+def format_countdown(seconds):
+    seconds = max(0, int(seconds + 0.999))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def update_console_countdown(target_timestamp, snipe_text):
+    remaining = max(0, target_timestamp - calibrated_time())
+    text = f"[{T()}] 倒计时 {format_countdown(remaining)} 至 {snipe_text}（回车可取消）"
+    width = max(80, len(text) + 4)
+    stream = sys.__stdout__
+    try:
+        stream.write("\r" + text.ljust(width))
+        stream.flush()
+    except Exception:
+        pass
+
+
 def is_cancel_pressed():
     if sys.platform == 'win32':
         import msvcrt
@@ -375,15 +522,26 @@ def is_cancel_pressed():
     return False
 
 
-def sleep_until_with_cancel(target_timestamp):
+def sleep_until_with_cancel(target_timestamp, snipe_text=None):
     deadline = make_deadline(target_timestamp)
+    next_tick = 0
     while True:
         remaining = deadline - time.perf_counter()
         if remaining <= 0.25:
             break
+        now = time.perf_counter()
+        if snipe_text and now >= next_tick:
+            update_console_countdown(target_timestamp, snipe_text)
+            next_tick = now + 1
         if is_cancel_pressed():
+            if snipe_text:
+                sys.__stdout__.write("\n")
             return False
-        time.sleep(min(remaining - 0.2, 1))
+        time.sleep(min(remaining - 0.2, 0.2))
+    if snipe_text:
+        update_console_countdown(target_timestamp, snipe_text)
+        sys.__stdout__.write("\n")
+        sys.__stdout__.flush()
     sleep_until_deadline(deadline)
     return True
 
@@ -415,15 +573,19 @@ def calc_next_retry_wait(msg, fallback_interval):
 
 def fire_once(label, session, token, uid, raw_payload, request_timeout, planned_ts, snipe_ts):
     sleep_until(planned_ts)
-    sent_at = calibrated_time()
-    started = time.perf_counter()
-    ok, msg = do_book(session, token, uid, raw_payload, request_timeout)
-    latency = time.perf_counter() - started
+    trigger_at = calibrated_time()
+    ok, msg, meta = do_book(session, token, uid, raw_payload, request_timeout)
     short_msg = msg[:40] + "..." if len(msg) > 40 else msg
-    elapsed = sent_at - snipe_ts
+    trigger_elapsed = trigger_at - snipe_ts
+    post_elapsed = meta["post_started_at"] - snipe_ts
     status = "OK" if ok else "X"
-    sent_text = format_beijing_timestamp(sent_at)
-    print(f"[{T()}] [{status}] {label}: 发出 {sent_text} ({elapsed:+.3f}s), 响应 {latency:.3f}s | {short_msg}")
+    trigger_text = format_beijing_timestamp(trigger_at)
+    post_text = format_beijing_timestamp(meta["post_started_at"])
+    print(
+        f"[{T()}] [{status}] {label}: 触发 {trigger_text} ({trigger_elapsed:+.3f}s), "
+        f"POST {post_text} ({post_elapsed:+.3f}s), 加密 {meta['crypto_latency']*1000:.1f}ms, "
+        f"响应 {meta['latency']:.3f}s, HTTP {meta['http_status']}, code {meta['code']} | {short_msg}"
+    )
     return ok, msg
 
 
@@ -434,6 +596,7 @@ def get_snipe_datetime(target_date, snipe_time):
 
 
 if __name__ == "__main__":
+    setup_logging()
     enable_high_resolution_timer()
 
     config = ensure_config_defaults(load_config())
@@ -467,6 +630,7 @@ if __name__ == "__main__":
     token = auto_get_token(config)
     if not token:
         exit()
+    warn_if_token_expires_before_snipe(token, snipe_ts)
     uid = extract_uid(token)
     if not uid:
         print(f"[{T()}] [X] 无法提取用户ID")
@@ -493,8 +657,7 @@ if __name__ == "__main__":
         wait_seconds = 0
 
     if wait_seconds > 0:
-        print(f"[{T()}] 倒计时 {wait_seconds:.0f}s 至 {snipe_text}（回车可取消）...")
-        if not sleep_until_with_cancel(fire_ts):
+        if not sleep_until_with_cancel(fire_ts, snipe_text):
             print(f"[{T()}] [*] 已取消")
             exit()
 
@@ -524,14 +687,17 @@ if __name__ == "__main__":
                 print(f"[{T()}] [*] 已取消捡漏")
                 break
 
-            sent_at = calibrated_time()
-            started = time.perf_counter()
-            ok, msg = do_book(session, token, uid, raw, REQUEST_TIMEOUT)
-            latency = time.perf_counter() - started
+            trigger_at = calibrated_time()
+            ok, msg, meta = do_book(session, token, uid, raw, REQUEST_TIMEOUT)
             short_msg = msg[:40] + "..." if len(msg) > 40 else msg
             status = "OK" if ok else "X"
-            sent_text = format_beijing_timestamp(sent_at)
-            print(f"[{T()}] [{status}] 捡漏{i+1}: 发出 {sent_text}, 响应 {latency:.3f}s | {short_msg}")
+            trigger_text = format_beijing_timestamp(trigger_at)
+            post_text = format_beijing_timestamp(meta["post_started_at"])
+            print(
+                f"[{T()}] [{status}] 捡漏{i+1}: 触发 {trigger_text}, POST {post_text}, "
+                f"加密 {meta['crypto_latency']*1000:.1f}ms, 响应 {meta['latency']:.3f}s, "
+                f"HTTP {meta['http_status']}, code {meta['code']} | {short_msg}"
+            )
             if ok:
                 done = True
                 print(f"[{T()}] [OK] 捡漏成功！")
