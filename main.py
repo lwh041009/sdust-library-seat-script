@@ -305,6 +305,48 @@ def calibrate_beijing_time(config):
 
 
 # ====== Reqable 抓包 Token 提取 ======
+def scan_latest_reqable_token(config):
+    cfg_student_id = str(config.get("student_id", ""))
+    capture_dir = find_reqable_capture_dir()
+    if not capture_dir:
+        print(f"[{T()}] [X] 找不到 Reqable 抓包目录")
+        print(f"[{T()}] [X] 请确保：1. 打开 Reqable  2. 打开微信一点通  3. 小程序加载完成")
+        return None, None
+
+    scan_result = scan_reqable_for_token(capture_dir, expected_user_id=cfg_student_id)
+    print(
+        f"[{T()}] [*] Reqable扫描: 文件 {scan_result['scanned']}/{scan_result['total_files']} | "
+        f"候选 {scan_result['token_candidates']} | 图书馆JWT {scan_result['library_candidates']} | "
+        f"耗时 {scan_result.get('elapsed_seconds', 0):.2f}s"
+    )
+
+    token = scan_result.get("token")
+    if not token:
+        best_expired = scan_result.get("best_expired")
+        if best_expired:
+            print(f"[{T()}] [X] 最近匹配到的图书馆 Token 已过期: {format_exp(best_expired['exp'])}")
+            print(f"[{T()}] [X] 来源文件: {best_expired['source']}")
+        if scan_result.get("mismatched_library_tokens"):
+            print(f"[{T()}] [X] 发现其他账号的图书馆 Token: {scan_result['mismatched_library_tokens']} 个")
+        if scan_result.get("other_jwts"):
+            print(f"[{T()}] [*] 已忽略非图书馆 JWT: {scan_result['other_jwts']} 个")
+        return None, scan_result
+
+    payload = decode_jwt_payload(token)
+    if payload:
+        token_uid = library_user_id(payload)
+        if token_uid != cfg_student_id:
+            print(f"[{T()}] [!] 警告: 抓到的 Token 用户({token_uid}) 与配置学号({cfg_student_id}) 不一致")
+            print(f"[{T()}] [!] 请确保一点通登录的是正确的账号")
+    return token, scan_result
+
+
+def save_token(config, token):
+    config["token"] = token
+    with open('user_data.json', 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
+
+
 def auto_get_token(config):
     existing = config.get("token", "")
     cfg_student_id = str(config.get("student_id", ""))
@@ -312,7 +354,19 @@ def auto_get_token(config):
     if is_library_token_valid(existing, expected_user_id=cfg_student_id):
         payload = decode_jwt_payload(existing)
         exp = jwt_exp(payload) if payload else 0
-        print(f"[{T()}] [*] 现有 Token 有效且账号匹配，复用 (exp: {format_exp(exp)})")
+        print(f"[{T()}] [*] 现有 Token 有效且账号匹配 (exp: {format_exp(exp)})")
+        print(f"[{T()}] [*] 仍会扫描 Reqable，优先使用最近抓到的新 Token...")
+        token, scan_result = scan_latest_reqable_token(config)
+        if token:
+            scanned_payload = decode_jwt_payload(token)
+            scanned_exp = jwt_exp(scanned_payload) if scanned_payload else 0
+            if token != existing:
+                save_token(config, token)
+                print(f"[{T()}] [*] 已更新为 Reqable 最新 Token (exp: {format_exp(scanned_exp)})")
+                return token
+            print(f"[{T()}] [*] Reqable 最新 Token 与配置一致，复用")
+        else:
+            print(f"[{T()}] [!] Reqable 未找到更新 Token，继续复用配置里的现有 Token")
         return existing
 
     if existing:
@@ -330,43 +384,14 @@ def auto_get_token(config):
             print(f"[{T()}] [!] 现有 Token 无法解析，重新抓取")
 
     print(f"[{T()}] [*] 尝试从 Reqable 抓包获取 Token...")
-    capture_dir = find_reqable_capture_dir()
-    if not capture_dir:
-        print(f"[{T()}] [X] 找不到 Reqable 抓包目录")
-        print(f"[{T()}] [X] 请确保：1. 打开 Reqable  2. 打开微信一点通  3. 小程序加载完成")
-        return None
-
-    scan_result = scan_reqable_for_token(capture_dir, expected_user_id=cfg_student_id)
-    print(
-        f"[{T()}] [*] Reqable扫描: 文件 {scan_result['scanned']}/{scan_result['total_files']} | "
-        f"候选 {scan_result['token_candidates']} | 图书馆JWT {scan_result['library_candidates']} | "
-        f"耗时 {scan_result.get('elapsed_seconds', 0):.2f}s"
-    )
-
-    token = scan_result.get("token")
+    token, scan_result = scan_latest_reqable_token(config)
     if not token:
         print(f"[{T()}] [X] 未从抓包中找到有效的图书馆 Token")
-        best_expired = scan_result.get("best_expired")
-        if best_expired:
-            print(f"[{T()}] [X] 最近匹配到的图书馆 Token 已过期: {format_exp(best_expired['exp'])}")
-            print(f"[{T()}] [X] 来源文件: {best_expired['source']}")
-        if scan_result.get("mismatched_library_tokens"):
-            print(f"[{T()}] [X] 发现其他账号的图书馆 Token: {scan_result['mismatched_library_tokens']} 个")
-        if scan_result.get("other_jwts"):
-            print(f"[{T()}] [*] 已忽略非图书馆 JWT: {scan_result['other_jwts']} 个")
         print(f"[{T()}] [X] 请重新打开一点通并确认已经重新登录，再运行脚本")
         return None
 
-    payload = decode_jwt_payload(token)
-    if payload:
-        token_uid = library_user_id(payload)
-        if token_uid != cfg_student_id:
-            print(f"[{T()}] [!] 警告: 抓到的 Token 用户({token_uid}) 与配置学号({cfg_student_id}) 不一致")
-            print(f"[{T()}] [!] 请确保一点通登录的是正确的账号")
     print(f"[{T()}] [*] 抓包获取 Token 成功: {token[:40]}... (exp: {format_exp(scan_result.get('exp', 0))})")
-    config["token"] = token
-    with open('user_data.json', 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
+    save_token(config, token)
     return token
 
 
@@ -571,6 +596,25 @@ def calc_next_retry_wait(msg, fallback_interval):
     return max(fallback_interval, retry_seconds + 0.3)
 
 
+def is_login_invalid_message(msg):
+    return "登录信息已失效" in (msg or "") or "请重新登录" in (msg or "")
+
+
+def refresh_runtime_token(config):
+    print(f"[{T()}] [*] 检测到登录失效，尝试从 Reqable 刷新 Token...")
+    token, scan_result = scan_latest_reqable_token(config)
+    if not token:
+        print(f"[{T()}] [X] 刷新 Token 失败，请重新打开一点通并确认已产生新抓包")
+        return None, None
+    save_token(config, token)
+    uid = extract_uid(token)
+    if not uid:
+        print(f"[{T()}] [X] 新 Token 无法提取用户ID")
+        return None, None
+    print(f"[{T()}] [*] 已切换到新 Token (exp: {format_exp(scan_result.get('exp', 0))})")
+    return token, uid
+
+
 def fire_once(label, session, token, uid, raw_payload, request_timeout, planned_ts, snipe_ts):
     sleep_until(planned_ts)
     trigger_at = calibrated_time()
@@ -665,6 +709,11 @@ if __name__ == "__main__":
     print(f"[{T()}] 开抢！准点单发")
     done = False
     ok, last_msg = fire_once("首发", session, token, uid, raw, REQUEST_TIMEOUT, fire_ts, snipe_ts)
+    if not ok and is_login_invalid_message(last_msg):
+        new_token, new_uid = refresh_runtime_token(config)
+        if new_token and new_uid:
+            token, uid = new_token, new_uid
+            ok, last_msg = fire_once("首发重试", session, token, uid, raw, REQUEST_TIMEOUT, calibrated_time(), snipe_ts)
     if ok:
         done = True
 
@@ -698,6 +747,12 @@ if __name__ == "__main__":
                 f"加密 {meta['crypto_latency']*1000:.1f}ms, 响应 {meta['latency']:.3f}s, "
                 f"HTTP {meta['http_status']}, code {meta['code']} | {short_msg}"
             )
+            if not ok and is_login_invalid_message(msg):
+                new_token, new_uid = refresh_runtime_token(config)
+                if new_token and new_uid:
+                    token, uid = new_token, new_uid
+                    next_wait = 0
+                    continue
             if ok:
                 done = True
                 print(f"[{T()}] [OK] 捡漏成功！")
