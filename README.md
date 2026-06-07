@@ -14,7 +14,7 @@
 - 支持 NTP/HTTP 北京时间校准，不修改系统时间。
 - 校时请求会并行采样，避免多个服务器顺序超时导致启动卡住。
 - 支持准点单发，失败后按间隔自动捡漏。
-- 捡漏间隔会自动限制为至少 `5.2` 秒，降低触发“操作频繁”的概率。
+- 捡漏间隔会自动限制为至少 `5.0` 秒，降低触发“操作频繁”的概率。
 - 每次运行会在 `logs/` 目录生成 UTF-8 日志文件，方便回看首发和捡漏结果。
 - 等待开抢时，控制台会每秒刷新倒计时；按回车可以取消。
 
@@ -82,7 +82,8 @@ pip install requests urllib3 pycryptodome
     "time_sync_timeout": 1.0,
     "time_sync_samples": 3,
     "snipe_cooldown": 3,
-    "snipe_interval": 5.2,
+    "snipe_interval": 5.0,
+    "min_snipe_interval": 5.0,
     "snipe_max": 99999,
     "request_timeout": 2
 }
@@ -105,7 +106,8 @@ pip install requests urllib3 pycryptodome
 | `time_sync_timeout` | 单次校时超时时间，单位秒 |
 | `time_sync_samples` | 每个 NTP 服务器采样次数，脚本会优先采用网络延迟最低的一次 |
 | `snipe_cooldown` | 首发失败后，等待几秒进入捡漏 |
-| `snipe_interval` | 捡漏请求间隔，脚本会自动限制为至少 `5.2` 秒 |
+| `snipe_interval` | 捡漏请求间隔，默认 `5.0` 秒 |
+| `min_snipe_interval` | 捡漏请求最小间隔，默认 `5.0` 秒，低于该值会自动拉回 |
 | `snipe_max` | 最大捡漏次数 |
 | `request_timeout` | 单次预约请求超时时间，单位秒 |
 

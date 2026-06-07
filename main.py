@@ -144,7 +144,8 @@ def load_config():
             "time_sync_timeout": 1.0,
             "time_sync_samples": 3,
             "snipe_cooldown": 3,
-            "snipe_interval": 5.2,
+            "snipe_interval": 5.0,
+            "min_snipe_interval": 5.0,
             "snipe_max": 99999,
             "request_timeout": 2
         }
@@ -172,7 +173,8 @@ def ensure_config_defaults(config):
         "time_sync_timeout": 1.0,
         "time_sync_samples": 3,
         "snipe_cooldown": 3,
-        "snipe_interval": 5.2,
+        "snipe_interval": 5.0,
+        "min_snipe_interval": 5.0,
         "snipe_max": 99999,
         "request_timeout": 2
     }
@@ -185,8 +187,9 @@ def ensure_config_defaults(config):
         if legacy_key in config:
             del config[legacy_key]
             changed = True
-    if float(config.get("snipe_interval", 5.2)) < 5.2:
-        config["snipe_interval"] = 5.2
+    min_snipe_interval = float(config.get("min_snipe_interval", 5.0))
+    if float(config.get("snipe_interval", 5.0)) < min_snipe_interval:
+        config["snipe_interval"] = min_snipe_interval
         changed = True
     if changed:
         save_config(config)
@@ -655,7 +658,8 @@ if __name__ == "__main__":
 
     FIRE_ADVANCE_MS = int(config.get("fire_advance_ms", 0))
     SNIPE_COOLDOWN = float(config.get("snipe_cooldown", 3))
-    SNIPE_INTERVAL = max(5.2, float(config.get("snipe_interval", 5.2)))
+    MIN_SNIPE_INTERVAL = float(config.get("min_snipe_interval", 5.0))
+    SNIPE_INTERVAL = max(MIN_SNIPE_INTERVAL, float(config.get("snipe_interval", 5.0)))
     SNIPE_MAX = int(config.get("snipe_max", 99999))
     REQUEST_TIMEOUT = float(config.get("request_timeout", 2))
 

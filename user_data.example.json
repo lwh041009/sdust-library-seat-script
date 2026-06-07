@@ -19,7 +19,8 @@
     "time_sync_timeout": 1.0,
     "time_sync_samples": 3,
     "snipe_cooldown": 3,
-    "snipe_interval": 5.2,
+    "snipe_interval": 5.0,
+    "min_snipe_interval": 5.0,
     "snipe_max": 99999,
     "request_timeout": 2
 }
