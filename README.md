@@ -259,8 +259,3 @@ logs/年月日_时分秒.log
 
 括号里的值越接近 `+0.000s`，说明越贴近准点。正数代表晚于开抢时间，负数代表提前发送；如果配置了 `fire_advance_ms`，出现对应的负数是正常的。
 
-- 学号
-- 密码
-- Token
-
-建议只上传脱敏示例文件，例如 `user_data.example.json`，并把真实的 `user_data.json` 放入 `.gitignore`。
