@@ -35,6 +35,7 @@ LOG_DIR = 'logs'
 BEIJING_TZ = timezone(timedelta(hours=8))
 TIME_OFFSET_SECONDS = 0.0
 LOG_HANDLE = None
+INSTANCE_LOCK_HANDLE = None
 
 
 # ====== 工具函数 ======
@@ -107,6 +108,47 @@ def shutdown_logging():
     LOG_HANDLE = None
 
 
+def acquire_instance_lock():
+    global INSTANCE_LOCK_HANDLE
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.GetLastError.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.CreateMutexW(None, True, "Global\\SdustLibrarySeatScript")
+            if not handle:
+                print(f"[{T()}] [X] 无法创建单实例锁，错误码 {ctypes.get_last_error()}")
+                return False
+            if kernel32.GetLastError() == 183:
+                kernel32.CloseHandle(handle)
+                print(f"[{T()}] [X] 已有一个抢座脚本正在运行，本次启动已停止")
+                print(f"[{T()}] [X] 请先关闭旧窗口，避免双开触发操作频繁")
+                return False
+
+            INSTANCE_LOCK_HANDLE = handle
+
+            def release_lock():
+                global INSTANCE_LOCK_HANDLE
+                if INSTANCE_LOCK_HANDLE:
+                    kernel32.CloseHandle(INSTANCE_LOCK_HANDLE)
+                    INSTANCE_LOCK_HANDLE = None
+
+            atexit.register(release_lock)
+            return True
+        except Exception as e:
+            print(f"[{T()}] [!] 单实例锁启用失败: {e}")
+            return True
+
+    return True
+
+
 def calibrated_time():
     return time.time() + TIME_OFFSET_SECONDS
 
@@ -164,6 +206,16 @@ def save_config(config):
         json.dump(config, f, indent=4, ensure_ascii=False)
 
 
+def normalize_clock(value):
+    text = str(value).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M:%S")
+        except ValueError:
+            continue
+    return text
+
+
 def ensure_config_defaults(config):
     defaults = {
         "auto_update_target_date": True,
@@ -176,7 +228,7 @@ def ensure_config_defaults(config):
         "snipe_interval": 5.0,
         "min_snipe_interval": 5.0,
         "snipe_max": 99999,
-        "request_timeout": 2
+        "request_timeout": 3
     }
     changed = False
     for key, value in defaults.items():
@@ -191,6 +243,11 @@ def ensure_config_defaults(config):
     if float(config.get("snipe_interval", 5.0)) < min_snipe_interval:
         config["snipe_interval"] = min_snipe_interval
         changed = True
+    for key in ("snipe_time", "start_hour", "end_hour"):
+        normalized = normalize_clock(config.get(key, ""))
+        if normalized != config.get(key):
+            config[key] = normalized
+            changed = True
     if changed:
         save_config(config)
     return config
@@ -423,13 +480,25 @@ def do_book(session, token, user_id, raw_payload, request_timeout):
     crypto_latency = time.perf_counter() - crypto_started
     headers = {
         "Host": "tsg77.sdust.edu.cn",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 MicroMessenger/7.0.20.1781",
-        "UserId": user_id,
-        "Token": token,
-        "Content-Type": "application/json",
-        "OperateTime": str(ts),
+        "Connection": "keep-alive",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 "
+            "MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI "
+            "MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) "
+            "UnifiedPCWindowsWechat(0xf2541a1a) XWEB/19895"
+        ),
         "xweb_xhr": "1",
-        "Connection": "keep-alive"
+        "UserId": user_id,
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "OperateTime": str(ts),
+        "Token": token,
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Referer": "https://servicewechat.com/wxd5685b630fcaf8d4/42/page-frame.html",
+        "Accept-Language": "zh-CN,zh;q=0.9",
     }
     post_started_at = calibrated_time()
     started = time.perf_counter()
@@ -642,8 +711,27 @@ def get_snipe_datetime(target_date, snipe_time):
     return datetime.combine(target_day - timedelta(days=1), snipe_clock, tzinfo=BEIJING_TZ)
 
 
+def get_reservation_datetime(target_date, clock_text):
+    target_day = datetime.strptime(target_date, "%Y-%m-%d")
+    clock = datetime.strptime(normalize_clock(clock_text), "%H:%M:%S").time()
+    return datetime.combine(target_day, clock, tzinfo=BEIJING_TZ)
+
+
+def guard_reservation_window(config):
+    target_end_dt = get_reservation_datetime(config["target_date"], config["end_hour"])
+    target_end_ts = target_end_dt.timestamp()
+    if calibrated_time() <= target_end_ts:
+        return True
+    end_text = target_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{T()}] [X] 预约结束时间 {end_text} 已过，本次启动已停止")
+    print(f"[{T()}] [X] 请检查 target_date / start_hour / end_hour，避免旧日期脚本误触发频控")
+    return False
+
+
 if __name__ == "__main__":
     setup_logging()
+    if not acquire_instance_lock():
+        exit()
     enable_high_resolution_timer()
 
     config = ensure_config_defaults(load_config())
@@ -673,6 +761,9 @@ if __name__ == "__main__":
         f"时段: {config['start_hour']}-{config['end_hour']} | 开抢: {snipe_text} | "
         f"准点单发(提前{FIRE_ADVANCE_MS}ms)"
     )
+
+    if not guard_reservation_window(config):
+        exit()
 
     # === Token ===
     token = auto_get_token(config)

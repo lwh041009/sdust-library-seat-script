@@ -22,5 +22,5 @@
     "snipe_interval": 5.0,
     "min_snipe_interval": 5.0,
     "snipe_max": 99999,
-    "request_timeout": 2
+    "request_timeout": 3
 }

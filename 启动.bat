@@ -1,9 +1,10 @@
 @echo off
-chcp 65001
-:: 切换到当前文件所在的目录
-cd /d %~dp0
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+cd /d "%~dp0"
 
-echo 正在启动 图书馆抢座引擎...
-python main.py
+echo Starting library seat script...
+python -X utf8 main.py
 
 pause
