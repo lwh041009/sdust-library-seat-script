@@ -172,8 +172,8 @@ def T():
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         default_config = {
-            "student_id": "202311100913",
-            "password": "2017",
+            "student_id": "",
+            "password": "",
             "target_date": (beijing_now() + timedelta(days=1)).strftime('%Y-%m-%d'),
             "auto_update_target_date": True,
             "seat_code": "301011A",
@@ -195,7 +195,7 @@ def load_config():
             json.dump(default_config, f, indent=4, ensure_ascii=False)
         print(f"[{T()}] [*] 已生成配置文件模板: {CONFIG_PATH}")
         print(f"[{T()}] [*] 请先填写 student_id 和 password，然后运行本脚本")
-        exit()
+        sys.exit()
 
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -731,7 +731,7 @@ def guard_reservation_window(config):
 if __name__ == "__main__":
     setup_logging()
     if not acquire_instance_lock():
-        exit()
+        sys.exit()
     enable_high_resolution_timer()
 
     config = ensure_config_defaults(load_config())
@@ -763,17 +763,17 @@ if __name__ == "__main__":
     )
 
     if not guard_reservation_window(config):
-        exit()
+        sys.exit()
 
     # === Token ===
     token = auto_get_token(config)
     if not token:
-        exit()
+        sys.exit()
     warn_if_token_expires_before_snipe(token, snipe_ts)
     uid = extract_uid(token)
     if not uid:
         print(f"[{T()}] [X] 无法提取用户ID")
-        exit()
+        sys.exit()
     print(f"[{T()}] Token就绪 | 用户: {uid}")
 
     # === 预约参数 ===
@@ -798,7 +798,7 @@ if __name__ == "__main__":
     if wait_seconds > 0:
         if not sleep_until_with_cancel(fire_ts, snipe_text):
             print(f"[{T()}] [*] 已取消")
-            exit()
+            sys.exit()
 
     # === 准点单发 ===
     print(f"[{T()}] 开抢！准点单发")
@@ -818,7 +818,7 @@ if __name__ == "__main__":
         print(f"[{T()}] 冷静 {wait_after_first:.1f}s 后进入捡漏...")
         if not sleep_seconds_with_cancel(wait_after_first):
             print(f"[{T()}] [*] 已取消")
-            exit()
+            sys.exit()
 
         print(f"[{T()}] [X] 进入捡漏模式 ({SNIPE_INTERVAL}s/次，上限{SNIPE_MAX}次，回车取消)...")
         next_wait = 0
